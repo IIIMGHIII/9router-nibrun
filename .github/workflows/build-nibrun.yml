@@ -33,6 +33,19 @@ jobs:
         run: |
           test -f 9router/.next/standalone/custom-server.js
           test -f 9router/.next/standalone/server.js
+          test -d 9router/.next/standalone/node_modules/next
+
+      - name: Download portable Node (glibc x64)
+        run: |
+          set -euo pipefail
+          TARBALL=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt \
+            | awk '/node-v22\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz$/{print $2; exit}')
+          curl -fsSLo node.tar.xz "https://nodejs.org/dist/latest-v22.x/${TARBALL}"
+          tar -xJf node.tar.xz
+          cp node-v22.*/bin/node ./node-linux-x64
+          chmod +x ./node-linux-x64
+          ./node-linux-x64 -v
+          cp ./node-linux-x64 9router/.next/standalone/node
 
       - name: Archive the standalone build
         run: tar czf app-bundle.tar.gz -C 9router/.next/standalone .
@@ -45,8 +58,8 @@ jobs:
           LAUNCHER_JS: |
             import bundleAsset from "./app-bundle.tar.gz" with { type: "file" };
             import { BUNDLE_STAMP } from "./stamp.js";
-            import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
-            import { createRequire } from "node:module";
+            import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync, chmodSync, copyFileSync } from "node:fs";
+            import { spawn } from "node:child_process";
             import path from "node:path";
 
             const nibrunDataDir = process.env.NIBRUN_DATA_DIR || process.env.DATA_DIR || "/app/data";
@@ -54,12 +67,13 @@ jobs:
             const stateDir = path.join(nibrunDataDir, "state");
             const stampPath = path.join(nibrunDataDir, ".app-code-stamp");
 
-            mkdirSync(codeDir, { recursive: true });
             mkdirSync(stateDir, { recursive: true });
 
             const ready =
               existsSync(path.join(codeDir, "custom-server.js")) &&
               existsSync(path.join(codeDir, "server.js")) &&
+              existsSync(path.join(codeDir, "node")) &&
+              existsSync(path.join(codeDir, "node_modules/next")) &&
               existsSync(stampPath) &&
               readFileSync(stampPath, "utf8").trim() === BUNDLE_STAMP;
 
@@ -72,18 +86,31 @@ jobs:
               writeFileSync(stampPath, BUNDLE_STAMP);
             }
 
+            const nodeSrc = path.join(codeDir, "node");
+            if (!existsSync(nodeSrc)) throw new Error("missing extracted node binary");
+            if (!existsSync(path.join(codeDir, "node_modules/next"))) {
+              throw new Error("standalone bundle missing node_modules/next");
+            }
+
+            const nodeBin = "/tmp/9router-node";
+            copyFileSync(nodeSrc, nodeBin);
+            chmodSync(nodeBin, 0o755);
+
             process.env.HOME = stateDir;
             process.env.DATA_DIR = stateDir;
             process.env.NODE_ENV = "production";
             process.env.HOSTNAME = "0.0.0.0";
-            if (process.env.NIBRUN_HTTP_PORT) {
-              process.env.PORT = process.env.NIBRUN_HTTP_PORT;
-            }
+            if (process.env.NIBRUN_HTTP_PORT) process.env.PORT = process.env.NIBRUN_HTTP_PORT;
 
-            process.chdir(codeDir);
-            const require = createRequire(path.join(codeDir, "server.js"));
-            require(path.join(codeDir, "custom-server.js"));
-            require(path.join(codeDir, "server.js"));
+            const child = spawn(nodeBin, [path.join(codeDir, "custom-server.js")], {
+              cwd: codeDir,
+              stdio: "inherit",
+              env: process.env,
+            });
+            for (const sig of ["SIGINT", "SIGTERM"]) {
+              process.on(sig, () => child.kill(sig));
+            }
+            child.on("exit", (code) => process.exit(code ?? 1));
         run: printf '%s\n' "$LAUNCHER_JS" > launcher.js
 
       - name: Compile launcher to a single Linux x64 binary
