@@ -1,15 +1,16 @@
-name: Deploy to nibrun
+name: Build nibrun binary
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch: {}
 
+permissions:
+  contents: write   # needed to create the release + upload the asset
+
 jobs:
-  build-and-deploy:
+  build-and-release:
     runs-on: ubuntu-latest
     steps:
-      # This repo holds only the deploy workflow, not 9router's source —
+      # This repo holds only this workflow, not 9router's source —
       # pull the actual app from upstream. Pin `ref` to a release tag
       # (e.g. v0.5.35) instead of `master` if you want reproducible builds.
       - name: Checkout 9router source
@@ -42,41 +43,33 @@ jobs:
             ./.next/standalone/custom-server.js \
             --outfile 9router-linux-x64
 
-      - name: Upload binary as a build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: 9router-linux-x64
-          path: 9router-linux-x64
-          retention-days: 7
+      - name: Checksum
+        run: sha256sum 9router-linux-x64 > SHA256SUMS
 
-      # --- Deploy step ---
-      # NOTE: `nib`'s non-interactive/CI auth flag isn't something I could
-      # confirm from public docs (the CLI is only days old as of writing).
-      # Run `nib login --help` / `nib run --help` locally once to get the
-      # exact flag or env var name, then adjust the two lines below.
-      - name: Install nib CLI
-        run: curl -fsSL https://nibrun.com/install.sh | sh
-
-      - name: Deploy to nibrun
-        env:
-          # Replace NIBRUN_TOKEN with whatever `nib --help` shows for
-          # non-interactive auth (API key / account token / etc.)
-          NIBRUN_TOKEN: ${{ secrets.NIBRUN_TOKEN }}
-          JWT_SECRET: ${{ secrets.NINEROUTER_JWT_SECRET }}
-          INITIAL_PASSWORD: ${{ secrets.NINEROUTER_INITIAL_PASSWORD }}
-          API_KEY_SECRET: ${{ secrets.NINEROUTER_API_KEY_SECRET }}
-          MACHINE_ID_SALT: ${{ secrets.NINEROUTER_MACHINE_ID_SALT }}
+      # Tag with the date, so a same-day rerun doesn't collide.
+      - name: Compute release tag
+        id: tag
         run: |
-          nib run ./9router-linux-x64 \
-            --name 9router \
-            --env NODE_ENV=production \
-            --env NEXT_TELEMETRY_DISABLED=1 \
-            --env JWT_SECRET="$JWT_SECRET" \
-            --env INITIAL_PASSWORD="$INITIAL_PASSWORD" \
-            --env API_KEY_SECRET="$API_KEY_SECRET" \
-            --env MACHINE_ID_SALT="$MACHINE_ID_SALT" \
-            --env DATA_DIR='${NIBRUN_DATA_DIR}' \
-            --env HOME='${NIBRUN_DATA_DIR}'
-          # PORT is injected automatically by nibrun (alias of NIBRUN_HTTP_PORT),
-          # and NIBRUN_HOSTNAME is what gives you the public HTTPS URL — no
-          # need to set either yourself.
+          base="v$(date +%Y.%m.%d)"
+          n=1
+          tag="${base}-${n}"
+          while gh release view "$tag" >/dev/null 2>&1; do
+            n=$((n + 1))
+            tag="${base}-${n}"
+          done
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            9router-linux-x64
+            SHA256SUMS
+
+      - name: Print deploy link
+        run: |
+          echo "Paste this into the nibrun dashboard's deploy-from-URL field:"
+          echo "https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/9router-linux-x64"
