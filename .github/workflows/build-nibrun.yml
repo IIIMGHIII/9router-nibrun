@@ -35,83 +35,84 @@ jobs:
           test -f 9router/.next/standalone/server.js
           test -d 9router/.next/standalone/node_modules/next
 
-      - name: Download portable Node (glibc x64)
+      - name: Download portable Node
         run: |
           set -euo pipefail
-          TARBALL=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt \
-            | awk '/node-v22\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz$/{print $2; exit}')
+          TARBALL=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | awk '/node-v22\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz$/{print $2; exit}')
           curl -fsSLo node.tar.xz "https://nodejs.org/dist/latest-v22.x/${TARBALL}"
           tar -xJf node.tar.xz
-          cp node-v22.*/bin/node ./node-linux-x64
-          chmod +x ./node-linux-x64
-          ./node-linux-x64 -v
-          cp ./node-linux-x64 9router/.next/standalone/node
+          cp node-v22.*/bin/node 9router/.next/standalone/node
+          chmod +x 9router/.next/standalone/node
+          9router/.next/standalone/node -v
 
       - name: Archive the standalone build
         run: tar czf app-bundle.tar.gz -C 9router/.next/standalone .
 
-      - name: Write stamp module
-        run: echo "export const BUNDLE_STAMP = \"$(sha256sum app-bundle.tar.gz | awk '{print $1}')\";" > stamp.js
-
       - name: Write launcher
-        env:
-          LAUNCHER_JS: |
-            import bundleAsset from "./app-bundle.tar.gz" with { type: "file" };
-            import { BUNDLE_STAMP } from "./stamp.js";
-            import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync, chmodSync, copyFileSync } from "node:fs";
-            import { spawn } from "node:child_process";
-            import path from "node:path";
-
-            const nibrunDataDir = process.env.NIBRUN_DATA_DIR || process.env.DATA_DIR || "/app/data";
-            const codeDir = path.join(nibrunDataDir, "app-code");
-            const stateDir = path.join(nibrunDataDir, "state");
-            const stampPath = path.join(nibrunDataDir, ".app-code-stamp");
-
-            mkdirSync(stateDir, { recursive: true });
-
-            const ready =
-              existsSync(path.join(codeDir, "custom-server.js")) &&
-              existsSync(path.join(codeDir, "server.js")) &&
-              existsSync(path.join(codeDir, "node")) &&
-              existsSync(path.join(codeDir, "node_modules/next")) &&
-              existsSync(stampPath) &&
-              readFileSync(stampPath, "utf8").trim() === BUNDLE_STAMP;
-
-            if (!ready) {
-              rmSync(codeDir, { recursive: true, force: true });
-              mkdirSync(codeDir, { recursive: true });
-              const tarBuf = await Bun.file(bundleAsset).bytes();
-              const count = await new Bun.Archive(tarBuf).extract(codeDir);
-              console.log("[nibrun] extracted " + count + " entries");
-              writeFileSync(stampPath, BUNDLE_STAMP);
-            }
-
-            const nodeSrc = path.join(codeDir, "node");
-            if (!existsSync(nodeSrc)) throw new Error("missing extracted node binary");
-            if (!existsSync(path.join(codeDir, "node_modules/next"))) {
-              throw new Error("standalone bundle missing node_modules/next");
-            }
-
-            const nodeBin = "/tmp/9router-node";
-            copyFileSync(nodeSrc, nodeBin);
-            chmodSync(nodeBin, 0o755);
-
-            process.env.HOME = stateDir;
-            process.env.DATA_DIR = stateDir;
-            process.env.NODE_ENV = "production";
-            process.env.HOSTNAME = "0.0.0.0";
-            if (process.env.NIBRUN_HTTP_PORT) process.env.PORT = process.env.NIBRUN_HTTP_PORT;
-
-            const child = spawn(nodeBin, [path.join(codeDir, "custom-server.js")], {
-              cwd: codeDir,
-              stdio: "inherit",
-              env: process.env,
-            });
-            for (const sig of ["SIGINT", "SIGTERM"]) {
-              process.on(sig, () => child.kill(sig));
-            }
-            child.on("exit", (code) => process.exit(code ?? 1));
-        run: printf '%s\n' "$LAUNCHER_JS" > launcher.js
+        run: |
+          base64 -d > launcher.js << 'B64'
+          aW1wb3J0IGJ1bmRsZUFzc2V0IGZyb20gIi4vYXBwLWJ1bmRsZS50YXIuZ3oiIHdpdGggeyB0eXBl
+          OiAiZmlsZSIgfTsKaW1wb3J0IHsgQlVORExFX1NUQU1QIH0gZnJvbSAiLi9zdGFtcC5qcyI7Cmlt
+          cG9ydCB7CiAgZXhpc3RzU3luYywKICBta2RpclN5bmMsCiAgcm1TeW5jLAogIHdyaXRlRmlsZVN5
+          bmMsCiAgcmVhZEZpbGVTeW5jLAogIGNobW9kU3luYywKfSBmcm9tICJub2RlOmZzIjsKaW1wb3J0
+          IHsgc3Bhd24gfSBmcm9tICJub2RlOmNoaWxkX3Byb2Nlc3MiOwppbXBvcnQgeyBkbG9wZW4sIEZG
+          SVR5cGUsIHB0ciB9IGZyb20gImJ1bjpmZmkiOwppbXBvcnQgcGF0aCBmcm9tICJub2RlOnBhdGgi
+          OwoKY29uc3QgbmlicnVuRGF0YURpciA9CiAgcHJvY2Vzcy5lbnYuTklCUlVOX0RBVEFfRElSIHx8
+          IHByb2Nlc3MuZW52LkRBVEFfRElSIHx8ICIvYXBwL2RhdGEiOwpjb25zdCBjb2RlRGlyID0gcGF0
+          aC5qb2luKG5pYnJ1bkRhdGFEaXIsICJhcHAtY29kZSIpOwpjb25zdCBzdGF0ZURpciA9IHBhdGgu
+          am9pbihuaWJydW5EYXRhRGlyLCAic3RhdGUiKTsKY29uc3Qgc3RhbXBQYXRoID0gcGF0aC5qb2lu
+          KG5pYnJ1bkRhdGFEaXIsICIuYXBwLWNvZGUtc3RhbXAiKTsKCm1rZGlyU3luYyhzdGF0ZURpciwg
+          eyByZWN1cnNpdmU6IHRydWUgfSk7Cgpjb25zdCByZWFkeSA9CiAgZXhpc3RzU3luYyhwYXRoLmpv
+          aW4oY29kZURpciwgImN1c3RvbS1zZXJ2ZXIuanMiKSkgJiYKICBleGlzdHNTeW5jKHBhdGguam9p
+          bihjb2RlRGlyLCAic2VydmVyLmpzIikpICYmCiAgZXhpc3RzU3luYyhwYXRoLmpvaW4oY29kZURp
+          ciwgIm5vZGUiKSkgJiYKICBleGlzdHNTeW5jKHBhdGguam9pbihjb2RlRGlyLCAibm9kZV9tb2R1
+          bGVzL25leHQiKSkgJiYKICBleGlzdHNTeW5jKHN0YW1wUGF0aCkgJiYKICByZWFkRmlsZVN5bmMo
+          c3RhbXBQYXRoLCAidXRmOCIpLnRyaW0oKSA9PT0gQlVORExFX1NUQU1QOwoKaWYgKCFyZWFkeSkg
+          ewogIHJtU3luYyhjb2RlRGlyLCB7IHJlY3Vyc2l2ZTogdHJ1ZSwgZm9yY2U6IHRydWUgfSk7CiAg
+          bWtkaXJTeW5jKGNvZGVEaXIsIHsgcmVjdXJzaXZlOiB0cnVlIH0pOwogIGNvbnN0IHRhckJ1ZiA9
+          IGF3YWl0IEJ1bi5maWxlKGJ1bmRsZUFzc2V0KS5ieXRlcygpOwogIGNvbnN0IGNvdW50ID0gYXdh
+          aXQgbmV3IEJ1bi5BcmNoaXZlKHRhckJ1ZikuZXh0cmFjdChjb2RlRGlyKTsKICBjb25zb2xlLmxv
+          ZygiW25pYnJ1bl0gZXh0cmFjdGVkICIgKyBjb3VudCArICIgZW50cmllcyIpOwogIHdyaXRlRmls
+          ZVN5bmMoc3RhbXBQYXRoLCBCVU5ETEVfU1RBTVApOwp9Cgpjb25zdCBub2RlQmluID0gcGF0aC5q
+          b2luKGNvZGVEaXIsICJub2RlIik7CmNvbnN0IHNjcmlwdCA9IHBhdGguam9pbihjb2RlRGlyLCAi
+          Y3VzdG9tLXNlcnZlci5qcyIpOwppZiAoIWV4aXN0c1N5bmMobm9kZUJpbikpIHRocm93IG5ldyBF
+          cnJvcigibWlzc2luZyBleHRyYWN0ZWQgbm9kZSBiaW5hcnkiKTsKaWYgKCFleGlzdHNTeW5jKHBh
+          dGguam9pbihjb2RlRGlyLCAibm9kZV9tb2R1bGVzL25leHQiKSkpIHsKICB0aHJvdyBuZXcgRXJy
+          b3IoInN0YW5kYWxvbmUgYnVuZGxlIG1pc3Npbmcgbm9kZV9tb2R1bGVzL25leHQiKTsKfQpjaG1v
+          ZFN5bmMobm9kZUJpbiwgMG83NTUpOwoKcHJvY2Vzcy5lbnYuSE9NRSA9IHN0YXRlRGlyOwpwcm9j
+          ZXNzLmVudi5EQVRBX0RJUiA9IHN0YXRlRGlyOwpwcm9jZXNzLmVudi5OT0RFX0VOViA9ICJwcm9k
+          dWN0aW9uIjsKcHJvY2Vzcy5lbnYuSE9TVE5BTUUgPSAiMC4wLjAuMCI7CmlmIChwcm9jZXNzLmVu
+          di5OSUJSVU5fSFRUUF9QT1JUKSBwcm9jZXNzLmVudi5QT1JUID0gcHJvY2Vzcy5lbnYuTklCUlVO
+          X0hUVFBfUE9SVDsKcHJvY2Vzcy5lbnYuTk9ERV9PUFRJT05TID0gW3Byb2Nlc3MuZW52Lk5PREVf
+          T1BUSU9OUywgIi0tbWF4LW9sZC1zcGFjZS1zaXplPTE2MCJdCiAgLmZpbHRlcihCb29sZWFuKQog
+          IC5qb2luKCIgIik7Cgpwcm9jZXNzLmNoZGlyKGNvZGVEaXIpOwoKZnVuY3Rpb24gY0xpc3QobGlz
+          dCkgewogIGNvbnN0IGJ1ZnMgPSBsaXN0Lm1hcCgocykgPT4gQnVmZmVyLmZyb20oU3RyaW5nKHMp
+          ICsgIlwwIikpOwogIGNvbnN0IHRhYmxlID0gbmV3IEJpZ1VpbnQ2NEFycmF5KGxpc3QubGVuZ3Ro
+          ICsgMSk7CiAgZm9yIChsZXQgaSA9IDA7IGkgPCBidWZzLmxlbmd0aDsgaSsrKSB0YWJsZVtpXSA9
+          IEJpZ0ludChwdHIoYnVmc1tpXSkpOwogIHJldHVybiB7IGJ1ZnMsIHRhYmxlLCBwOiBwdHIodGFi
+          bGUpIH07Cn0KCmZ1bmN0aW9uIGV4ZWN2ZVJlcGxhY2UoZmlsZSwgYXJndiwgZW52KSB7CiAgY29u
+          c3QgbGliY0ZpbGVzID0gWwogICAgIi9saWIveDg2XzY0LWxpbnV4LWdudS9saWJjLnNvLjYiLAog
+          ICAgIi9saWI2NC9saWJjLnNvLjYiLAogICAgImxpYmMuc28uNiIsCiAgXTsKICBsZXQgbGliYzsK
+          ICBmb3IgKGNvbnN0IGYgb2YgbGliY0ZpbGVzKSB7CiAgICB0cnkgewogICAgICBsaWJjID0gZGxv
+          cGVuKGYsIHsKICAgICAgICBleGVjdmU6IHsKICAgICAgICAgIGFyZ3M6IFtGRklUeXBlLmNzdHJp
+          bmcsIEZGSVR5cGUucHRyLCBGRklUeXBlLnB0cl0sCiAgICAgICAgICByZXR1cm5zOiBGRklUeXBl
+          LmkzMiwKICAgICAgICB9LAogICAgICB9KTsKICAgICAgYnJlYWs7CiAgICB9IGNhdGNoIHt9CiAg
+          fQogIGlmICghbGliYykgdGhyb3cgbmV3IEVycm9yKCJsaWJjLnNvLjYgbm90IGZvdW5kIik7CiAg
+          Y29uc3QgYSA9IGNMaXN0KGFyZ3YpOwogIGNvbnN0IGUgPSBjTGlzdCgKICAgIE9iamVjdC5lbnRy
+          aWVzKGVudikKICAgICAgLmZpbHRlcigoa3YpID0+IHR5cGVvZiBrdlsxXSA9PT0gInN0cmluZyIp
+          CiAgICAgIC5tYXAoKGt2KSA9PiBrdlswXSArICI9IiArIGt2WzFdKQogICk7CiAgZ2xvYmFsVGhp
+          cy5fX2V4ZWNQaW4gPSBbYSwgZV07CiAgbGliYy5zeW1ib2xzLmV4ZWN2ZShmaWxlLCBhLnAsIGUu
+          cCk7CiAgdGhyb3cgbmV3IEVycm9yKCJleGVjdmUgZmFpbGVkIik7Cn0KCnRyeSB7CiAgZXhlY3Zl
+          UmVwbGFjZShub2RlQmluLCBbbm9kZUJpbiwgc2NyaXB0XSwgcHJvY2Vzcy5lbnYpOwp9IGNhdGNo
+          IChlcnIpIHsKICBjb25zb2xlLmVycm9yKCJbbmlicnVuXSBleGVjdmUgZmFpbGVkLCBzcGF3biBm
+          YWxsYmFjazoiLCBlcnIgJiYgZXJyLm1lc3NhZ2UpOwogIGNvbnN0IGNoaWxkID0gc3Bhd24obm9k
+          ZUJpbiwgW3NjcmlwdF0sIHsKICAgIGN3ZDogY29kZURpciwKICAgIHN0ZGlvOiAiaW5oZXJpdCIs
+          CiAgICBlbnY6IHByb2Nlc3MuZW52LAogIH0pOwogIGZvciAoY29uc3Qgc2lnIG9mIFsiU0lHSU5U
+          IiwgIlNJR1RFUk0iXSkgewogICAgcHJvY2Vzcy5vbihzaWcsICgpID0+IGNoaWxkLmtpbGwoc2ln
+          KSk7CiAgfQogIGNoaWxkLm9uKCJleGl0IiwgKGNvZGUpID0+IHByb2Nlc3MuZXhpdChjb2RlID8/
+          IDEpKTsKfQo=
+          B64
+          echo "export const BUNDLE_STAMP = \"$(sha256sum app-bundle.tar.gz | awk '{print $1}')\";" > stamp.js
 
       - name: Compile launcher to a single Linux x64 binary
         run: bun build --compile --target=bun-linux-x64 ./launcher.js --outfile 9router-linux-x64
