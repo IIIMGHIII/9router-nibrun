@@ -46,23 +46,14 @@ jobs:
             const fs = require("fs");
             const file = ".next/standalone/custom-server.js";
             let src = fs.readFileSync(file, "utf8");
-            const needle = `if (require.main === module) {
-  const standalone = path.join(__dirname, "server.js");
-  if (fs.existsSync(standalone)) {
-    require(standalone);
-  } else {
-    // Repo checkout has no standalone build next to us. \`next start\` builds its HTTP
-    // server in-process, so the wrapper above still sanitizes every request.
-    const nextBin = require.resolve("next/dist/bin/next");
-    process.argv = [process.argv[0], nextBin, "start", ...process.argv.slice(2)];
-    require(nextBin);
-  }
-}`;
-            if (!src.includes(needle)) {
-              throw new Error("custom-server.js entrypoint block has changed upstream — update the patch");
+            const anchor = "if (require.main === module) {";
+            const idx = src.indexOf(anchor);
+            if (idx === -1) {
+              throw new Error("custom-server.js entrypoint anchor not found — upstream file changed, update the patch");
             }
-            src = src.replace(needle, `if (require.main === module) {\n  require("./server.js");\n}`);
+            src = src.slice(0, idx) + "if (require.main === module) {\n  require(\"./server.js\");\n}\n";
             fs.writeFileSync(file, src);
+            console.log("Patched custom-server.js entrypoint to a static require.");
           '
 
       # Compiles .next/standalone/custom-server.js (+ its bundled deps)
