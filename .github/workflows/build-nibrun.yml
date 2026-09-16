@@ -18,6 +18,7 @@ jobs:
         with:
           repository: decolua/9router
           ref: master
+          path: 9router
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
@@ -27,42 +28,73 @@ jobs:
       # 9router installs with npm but builds fine under bun for this step,
       # matching the repo's own build:bun script.
       - name: Install dependencies
+        working-directory: 9router
         run: npm install
 
       - name: Build Next.js standalone bundle
+        working-directory: 9router
         run: bun run build:bun
         env:
           NEXT_TELEMETRY_DISABLED: "1"
 
-      # custom-server.js locates server.js via a *computed* path
-      # (path.join(__dirname, "server.js")), so Bun's --compile bundler can't
-      # statically trace it and never embeds the real standalone server —
-      # it falls through to a dev-only fallback that shells out to
-      # next/dist/bin/next, baking in a CI-only absolute path that doesn't
-      # exist at runtime. Force a literal require so Bun can actually embed it.
-      - name: Patch custom-server.js for static bundling
+      - name: Verify standalone build is self-contained
         run: |
-          node -e '
-            const fs = require("fs");
-            const file = ".next/standalone/custom-server.js";
-            let src = fs.readFileSync(file, "utf8");
-            const anchor = "if (require.main === module) {";
-            const idx = src.indexOf(anchor);
-            if (idx === -1) {
-              throw new Error("custom-server.js entrypoint anchor not found — upstream file changed, update the patch");
-            }
-            src = src.slice(0, idx) + "if (require.main === module) {\n  require(\"./server.js\");\n}\n";
-            fs.writeFileSync(file, src);
-            console.log("Patched custom-server.js entrypoint to a static require.");
-          '
+          test -f 9router/.next/standalone/custom-server.js
+          test -f 9router/.next/standalone/server.js
 
-      # Compiles .next/standalone/custom-server.js (+ its bundled deps)
-      # into one self-contained Linux x64 executable — the shape nibrun expects.
-      - name: Compile to a single Linux x64 binary
+      # Bun's --compile cannot statically bundle the real Next.js server
+      # (its internals reference dozens of optional/dev-only packages never
+      # meant to be traced ahead of time — webpack, sass, critters, the
+      # react-server-dom variants, etc.). So instead of compiling the app,
+      # we archive the whole working standalone build (real files, real
+      # node_modules) and let a tiny launcher extract + require() it from
+      # real disk at boot — ordinary runtime module resolution, no static
+      # bundling involved.
+      - name: Archive the standalone build
+        run: tar czf app-bundle.tar.gz -C 9router/.next/standalone .
+
+      - name: Write launcher
+        run: |
+          cat > launcher.js << 'EOF'
+          import bundleAsset from "./app-bundle.tar.gz" with { type: "file" };
+          import { existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
+          import { execFileSync } from "child_process";
+          import path from "path";
+
+          const nibrunDataDir = process.env.NIBRUN_DATA_DIR || process.env.DATA_DIR || "/app/data";
+
+          // Code is re-extracted fresh on every boot, so it always matches the
+          // currently deployed binary — never mix this with persistent app state.
+          const codeDir = path.join(nibrunDataDir, "app-code");
+
+          // 9router's own database/config lives here instead, untouched by extraction.
+          const stateDir = path.join(nibrunDataDir, "state");
+
+          rmSync(codeDir, { recursive: true, force: true });
+          mkdirSync(codeDir, { recursive: true });
+          mkdirSync(stateDir, { recursive: true });
+
+          const tarBuf = Buffer.from(await Bun.file(bundleAsset).arrayBuffer());
+          const tmpTar = "/tmp/app-bundle.tar.gz";
+          writeFileSync(tmpTar, tarBuf);
+          execFileSync("tar", ["xzf", tmpTar, "-C", codeDir]);
+
+          // HOME=/app is read-only in the guest; point HOME and 9router's DATA_DIR
+          // at the writable, persistent state directory instead.
+          process.env.HOME = stateDir;
+          process.env.DATA_DIR = stateDir;
+
+          require(path.join(codeDir, "custom-server.js"));
+          EOF
+
+      # launcher.js only touches fs/path/child_process (Bun builtins) plus
+      # the embedded tar.gz asset — nothing here needs Next.js's module
+      # graph, so this compiles cleanly.
+      - name: Compile launcher to a single Linux x64 binary
         run: |
           bun build --compile \
             --target=bun-linux-x64 \
-            ./.next/standalone/custom-server.js \
+            ./launcher.js \
             --outfile 9router-linux-x64
 
       - name: Checksum
