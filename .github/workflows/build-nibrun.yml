@@ -8,85 +8,148 @@ permissions:
 
 jobs:
   build:
+    name: Linux x64 Nibrun build
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Setup Node.js
+
+      # ------------------------------------------------------------
+      # Node.js
+      # ------------------------------------------------------------
+
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: "22"
           package-manager-cache: false
 
-      - name: Download 9Router v0.5.35
+      # ------------------------------------------------------------
+      # Download the ACTUAL published npm package.
+      #
+      # This is important:
+      # GitHub source != the prebuilt npm package you tested locally.
+      # ------------------------------------------------------------
+
+      - name: Download 9Router 0.5.35 npm package
         shell: bash
         run: |
           set -eux
 
-          mkdir -p work
+          mkdir -p "$GITHUB_WORKSPACE/work"
 
-          curl -L --fail \
-            https://github.com/decolua/9router/archive/refs/tags/v0.5.35.tar.gz \
-            -o work/9router.tar.gz
+          cd "$GITHUB_WORKSPACE/work"
 
-          tar -xzf work/9router.tar.gz -C work
+          npm pack 9router@0.5.35
 
-          find work -maxdepth 3 -type f \
-            \( -name package.json -o -name server.js \) \
-            -print
+          ls -lh
 
-      - name: Locate 9Router
+          test -f 9router-0.5.35.tgz
+
+          tar -xzf 9router-0.5.35.tgz
+
+          echo "=== PACKAGE ==="
+          find package -maxdepth 3 -type f | sort | head -200
+
+      # ------------------------------------------------------------
+      # Verify the package is the one we expect.
+      # ------------------------------------------------------------
+
+      - name: Verify 9Router package
         shell: bash
         run: |
           set -eux
 
-          APP_DIR="$(find "$GITHUB_WORKSPACE/work" \
-            -type f \
-            -name package.json \
-            -print0 | \
-            xargs -0 -n1 dirname | \
-            while read d; do
-              if grep -q '"name"[[:space:]]*:[[:space:]]*"9router-app"' "$d/package.json"; then
-                echo "$d"
-                break
-              fi
-            done)"
+          APP_DIR="$GITHUB_WORKSPACE/work/package/app"
 
-          if [ -z "$APP_DIR" ]; then
-            echo "9Router package.json was not found"
-            find "$GITHUB_WORKSPACE/work" -maxdepth 5 -type f -name package.json -print
-            exit 1
-          fi
+          test -f "$APP_DIR/package.json"
+          test -f "$APP_DIR/server.js"
+          test -f "$APP_DIR/custom-server.js"
+
+          test -d "$APP_DIR/.next-cli-build"
+
+          VERSION="$(node -p "require('$APP_DIR/package.json').version")"
+
+          echo "9Router version: $VERSION"
+
+          test "$VERSION" = "0.5.35"
 
           echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
-          echo "Found 9Router at: $APP_DIR"
 
-      - name: Check version
-        shell: bash
-        run: |
-          set -eux
+      # ------------------------------------------------------------
+      # Show what came from npm.
+      # ------------------------------------------------------------
 
-          node -p "require('$APP_DIR/package.json').version"
-
-      - name: Install dependencies
+      - name: Inspect npm package
         working-directory: ${{ env.APP_DIR }}
         shell: bash
         run: |
           set -eux
 
+          echo "=== package.json ==="
+          cat package.json
+
+          echo
+          echo "=== BUILD ==="
+          du -sh .next-cli-build
+
+          echo
+          echo "=== NODE MODULES BEFORE REINSTALL ==="
+          du -sh node_modules || true
+
+          echo
+          echo "=== SERVER ==="
+          sed -n '1,100p' server.js
+
+      # ------------------------------------------------------------
+      # Remove the npm-package node_modules.
+      #
+      # We DO NOT trust the pre-existing node_modules because they
+      # may have been produced for another operating system.
+      # ------------------------------------------------------------
+
+      - name: Reinstall Linux dependencies
+        working-directory: ${{ env.APP_DIR }}
+        shell: bash
+        run: |
+          set -eux
+
+          rm -rf node_modules
+
           npm install \
+            --omit=dev \
             --no-audit \
             --no-fund \
             --ignore-scripts
 
-      - name: Build 9Router
+          echo "=== LINUX NODE_MODULES ==="
+          du -sh node_modules
+
+          find node_modules -maxdepth 2 -type d | head -100
+
+      # ------------------------------------------------------------
+      # Verify important runtime dependencies.
+      # ------------------------------------------------------------
+
+      - name: Verify runtime dependencies
         working-directory: ${{ env.APP_DIR }}
         shell: bash
         run: |
           set -eux
 
-          npm run build
+          node -e "require('next'); console.log('next OK')"
+          node -e "require('express'); console.log('express OK')"
+          node -e "require('sql.js'); console.log('sql.js OK')"
+          node -e "require('jose'); console.log('jose OK')"
+          node -e "require('undici'); console.log('undici OK')"
 
-      - name: Verify build
+      # ------------------------------------------------------------
+      # Verify the already-built Next.js application.
+      #
+      # We intentionally DON'T run npm run build here.
+      # The npm package already contains .next-cli-build.
+      # ------------------------------------------------------------
+
+      - name: Verify prebuilt Next.js application
         working-directory: ${{ env.APP_DIR }}
         shell: bash
         run: |
@@ -96,20 +159,136 @@ jobs:
           test -d .next-cli-build/server
           test -d .next-cli-build/static
 
-          echo "Build:"
+          echo "=== BUILD ID ==="
+          cat .next-cli-build/BUILD_ID
+
+          echo
+          echo "=== BUILD SIZE ==="
           du -sh .next-cli-build
 
-          echo "node_modules:"
-          du -sh node_modules
+          echo
+          echo "=== SERVER FILES ==="
+          find .next-cli-build/server \
+            -maxdepth 2 \
+            -type f \
+            | head -100
 
-      - name: Install postject
+      # ------------------------------------------------------------
+      # Test 9Router normally BEFORE creating the executable.
+      # ------------------------------------------------------------
+
+      - name: Test 9Router runtime
+        working-directory: ${{ env.APP_DIR }}
         shell: bash
         run: |
           set -eux
 
-          npm install -g postject@1.0.0-alpha.6
+          PORT=20127 \
+          HOSTNAME=127.0.0.1 \
+          node server.js > "$GITHUB_WORKSPACE/9router-test.log" 2>&1 &
 
-      - name: Create SEA launcher
+          SERVER_PID=$!
+
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+
+          echo "Server PID: $SERVER_PID"
+
+          for i in $(seq 1 30); do
+            if curl -fsS \
+              http://127.0.0.1:20127/ \
+              -o /tmp/9router-response \
+              2>/dev/null; then
+
+              echo
+              echo "=== 9ROUTER RESPONSE ==="
+              head -c 500 /tmp/9router-response || true
+              echo
+
+              break
+            fi
+
+            sleep 1
+
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "9Router exited."
+
+              echo "=== SERVER LOG ==="
+              cat "$GITHUB_WORKSPACE/9router-test.log"
+
+              exit 1
+            fi
+          done
+
+          if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "9Router failed to stay running."
+
+            cat "$GITHUB_WORKSPACE/9router-test.log"
+
+            exit 1
+          fi
+
+          echo
+          echo "9Router runtime test passed."
+
+      # ------------------------------------------------------------
+      # Create a self-contained runtime archive.
+      # ------------------------------------------------------------
+
+      - name: Create runtime archive
+        shell: bash
+        run: |
+          set -eux
+
+          rm -rf "$GITHUB_WORKSPACE/runtime"
+
+          mkdir -p "$GITHUB_WORKSPACE/runtime"
+
+          cp -a \
+            "$APP_DIR/.next-cli-build" \
+            "$GITHUB_WORKSPACE/runtime/"
+
+          cp -a \
+            "$APP_DIR/node_modules" \
+            "$GITHUB_WORKSPACE/runtime/"
+
+          cp -a \
+            "$APP_DIR/public" \
+            "$GITHUB_WORKSPACE/runtime/"
+
+          cp \
+            "$APP_DIR/package.json" \
+            "$GITHUB_WORKSPACE/runtime/"
+
+          cp \
+            "$APP_DIR/server.js" \
+            "$GITHUB_WORKSPACE/runtime/"
+
+          cp \
+            "$APP_DIR/custom-server.js" \
+            "$GITHUB_WORKSPACE/runtime/"
+
+          echo "=== RUNTIME SIZE ==="
+          du -sh "$GITHUB_WORKSPACE/runtime"
+
+          echo "=== RUNTIME CONTENT ==="
+          find "$GITHUB_WORKSPACE/runtime" \
+            -maxdepth 2 \
+            -type d \
+            | sort
+
+          tar \
+            -C "$GITHUB_WORKSPACE/runtime" \
+            -czf "$GITHUB_WORKSPACE/nibrun-runtime.tar.gz" \
+            .
+
+          echo "=== ARCHIVE ==="
+          ls -lh "$GITHUB_WORKSPACE/nibrun-runtime.tar.gz"
+
+      # ------------------------------------------------------------
+      # Create Node SEA entry point.
+      # ------------------------------------------------------------
+
+      - name: Create Nibrun launcher
         shell: bash
         run: |
           set -eux
@@ -125,7 +304,7 @@ jobs:
 
           const runtime = path.join(
             os.tmpdir(),
-            '9router-' + process.pid
+            '9router-nibrun-' + process.pid
           );
 
           fs.mkdirSync(runtime, {
@@ -144,7 +323,10 @@ jobs:
 
           fs.writeFileSync(
             archivePath,
-            archive
+            archive,
+            {
+              mode: 0o600
+            }
           );
 
           execFileSync(
@@ -176,38 +358,26 @@ jobs:
           process.chdir(runtime);
 
           require(
-            path.join(runtime, 'custom-server.js')
+            path.join(
+              runtime,
+              'custom-server.js'
+            )
           );
           EOF
 
-      - name: Create runtime archive
-        shell: bash
-        run: |
-          set -eux
+          echo "=== LAUNCHER ==="
+          cat "$GITHUB_WORKSPACE/nibrun-main.js"
 
-          rm -rf runtime
-          mkdir runtime
-
-          cp -a "$APP_DIR/.next-cli-build" runtime/
-          cp -a "$APP_DIR/node_modules" runtime/
-          cp -a "$APP_DIR/public" runtime/
-          cp -a "$APP_DIR/package.json" runtime/
-          cp -a "$APP_DIR/server.js" runtime/
-          cp -a "$APP_DIR/custom-server.js" runtime/
-
-          tar \
-            -C runtime \
-            -czf nibrun-runtime.tar.gz \
-            .
-
-          ls -lh nibrun-runtime.tar.gz
+      # ------------------------------------------------------------
+      # Create Node SEA configuration.
+      # ------------------------------------------------------------
 
       - name: Create SEA configuration
         shell: bash
         run: |
           set -eux
 
-          cat > sea-config.json <<'EOF'
+          cat > "$GITHUB_WORKSPACE/sea-config.json" <<'EOF'
           {
             "main": "./nibrun-main.js",
             "output": "./9router-nibrun.blob",
@@ -220,27 +390,58 @@ jobs:
           }
           EOF
 
-          cat sea-config.json
+          cat "$GITHUB_WORKSPACE/sea-config.json"
+
+      # ------------------------------------------------------------
+      # Generate SEA blob.
+      # ------------------------------------------------------------
 
       - name: Generate SEA blob
         shell: bash
         run: |
           set -eux
 
+          cd "$GITHUB_WORKSPACE"
+
           node \
             --experimental-sea-config \
             sea-config.json
 
+          test -f 9router-nibrun.blob
+
           ls -lh 9router-nibrun.blob
 
-      - name: Create Linux executable
+      # ------------------------------------------------------------
+      # Install postject.
+      # ------------------------------------------------------------
+
+      - name: Install postject
         shell: bash
         run: |
           set -eux
 
+          npm install \
+            --global \
+            postject@1.0.0-alpha.6
+
+          postject --version
+
+      # ------------------------------------------------------------
+      # Copy Linux Node executable and inject SEA blob.
+      # ------------------------------------------------------------
+
+      - name: Create Linux x64 Nibrun executable
+        shell: bash
+        run: |
+          set -eux
+
+          cd "$GITHUB_WORKSPACE"
+
           cp "$(command -v node)" 9router-nibrun
 
           chmod +x 9router-nibrun
+
+          file 9router-nibrun
 
           postject \
             9router-nibrun \
@@ -251,40 +452,131 @@ jobs:
 
           chmod +x 9router-nibrun
 
-      - name: Verify executable
+      # ------------------------------------------------------------
+      # Verify executable.
+      # ------------------------------------------------------------
+
+      - name: Verify Nibrun executable
         shell: bash
         run: |
           set -eux
 
+          cd "$GITHUB_WORKSPACE"
+
+          echo "=== FILE ==="
           file 9router-nibrun
 
+          echo
+          echo "=== SIZE ==="
           ls -lh 9router-nibrun
 
-          sha256sum 9router-nibrun
+          echo
+          echo "=== NODE SEA TEST ==="
 
-      - name: Package result
+          ./9router-nibrun \
+            --version || true
+
+      # ------------------------------------------------------------
+      # Test the actual generated executable.
+      # ------------------------------------------------------------
+
+      - name: Test Nibrun executable
         shell: bash
         run: |
           set -eux
 
-          mkdir -p dist
+          cd "$GITHUB_WORKSPACE"
 
-          cp 9router-nibrun dist/
+          PORT=3000 \
+          HOSTNAME=127.0.0.1 \
+          ./9router-nibrun \
+            > "$GITHUB_WORKSPACE/nibrun-test.log" 2>&1 &
+
+          SERVER_PID=$!
+
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+
+          echo "Executable PID: $SERVER_PID"
+
+          SUCCESS=0
+
+          for i in $(seq 1 45); do
+
+            if curl -fsS \
+              http://127.0.0.1:3000/ \
+              -o /tmp/nibrun-response \
+              2>/dev/null; then
+
+              SUCCESS=1
+
+              echo
+              echo "=== RESPONSE ==="
+              head -c 1000 /tmp/nibrun-response || true
+              echo
+
+              break
+            fi
+
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo
+              echo "=== EXECUTABLE LOG ==="
+              cat "$GITHUB_WORKSPACE/nibrun-test.log"
+
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          if [ "$SUCCESS" != "1" ]; then
+            echo "Nibrun executable did not answer HTTP."
+
+            echo
+            echo "=== EXECUTABLE LOG ==="
+            cat "$GITHUB_WORKSPACE/nibrun-test.log"
+
+            exit 1
+          fi
+
+          echo
+          echo "Nibrun executable test PASSED."
+
+      # ------------------------------------------------------------
+      # Package artifact.
+      # ------------------------------------------------------------
+
+      - name: Package final Nibrun build
+        shell: bash
+        run: |
+          set -eux
+
+          cd "$GITHUB_WORKSPACE"
+
+          rm -rf dist
+
+          mkdir dist
+
+          cp \
+            9router-nibrun \
+            dist/
 
           cat > dist/README.txt <<'EOF'
           9Router v0.5.35
-          Nibrun Linux x86_64 build
+          Nibrun Linux x86_64 executable
 
-          Deploy:
+          Deploy with:
 
-          nib run ./9router-nibrun \
-            --name 9router \
-            --port 3000
+            nib run ./9router-nibrun \
+              --name 9router \
+              --port 3000
 
           The application listens on the Nibrun HTTP port.
+
+          No Docker or Podman is required.
           EOF
 
-          tar -czf \
+          tar \
+            -czf \
             9router-v0.5.35-nibrun-linux-x64.tar.gz \
             -C dist \
             .
@@ -294,7 +586,24 @@ jobs:
             9router-v0.5.35-nibrun-linux-x64.tar.gz \
             > SHA256SUMS.txt
 
-      - name: Upload Nibrun binary
+          echo
+          echo "=== FINAL FILES ==="
+
+          ls -lh \
+            9router-nibrun \
+            9router-v0.5.35-nibrun-linux-x64.tar.gz \
+            SHA256SUMS.txt
+
+          echo
+          echo "=== SHA256 ==="
+
+          cat SHA256SUMS.txt
+
+      # ------------------------------------------------------------
+      # Upload artifact.
+      # ------------------------------------------------------------
+
+      - name: Upload Nibrun executable
         uses: actions/upload-artifact@v4
         with:
           name: 9router-v0.5.35-nibrun-linux-x64
@@ -303,3 +612,4 @@ jobs:
             9router-v0.5.35-nibrun-linux-x64.tar.gz
             SHA256SUMS.txt
           if-no-files-found: error
+          retention-days: 30
