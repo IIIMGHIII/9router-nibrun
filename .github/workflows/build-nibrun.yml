@@ -1,0 +1,386 @@
+name: Build 9Router v0.5.35 for Nibrun
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Linux x86_64 Nibrun binary
+    runs-on: ubuntu-24.04
+
+    env:
+      NODE_VERSION: "22.22.1"
+      NIBRUN_PORT: "20128"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      # ------------------------------------------------------------
+      # Download the official 9Router v0.5.35 source.
+      # ------------------------------------------------------------
+      - name: Download 9Router v0.5.35
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p work
+
+          curl -fL \
+            https://github.com/decolua/9router/archive/refs/tags/v0.5.35.tar.gz \
+            -o work/9router-v0.5.35.tar.gz
+
+          tar -xzf work/9router-v0.5.35.tar.gz \
+            -C work
+
+          find work -maxdepth 2 -type d -print
+
+      - name: Locate 9Router application
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          APP="$(find "$GITHUB_WORKSPACE/work" \
+            -type f \
+            -name package.json \
+            -path '*/app/package.json' \
+            -print -quit)"
+
+          test -n "$APP"
+
+          APP_DIR="$(dirname "$APP")"
+
+          echo "9Router application:"
+          echo "$APP_DIR"
+
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+
+      - name: Verify 9Router version
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$APP_DIR"
+
+          node -p "require('./package.json').version"
+
+          test "$(node -p "require('./package.json').version")" = "0.5.35"
+
+      # ------------------------------------------------------------
+      # Install production dependencies.
+      #
+      # better-sqlite3 is optional in 9Router and sql.js is its
+      # documented fallback, so don't allow the optional native
+      # module to prevent the build.
+      # ------------------------------------------------------------
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$APP_DIR"
+
+          if [ -f package-lock.json ]; then
+            npm ci \
+              --omit=dev \
+              --ignore-scripts
+          else
+            npm install \
+              --omit=dev \
+              --ignore-scripts
+          fi
+
+      # ------------------------------------------------------------
+      # Build the existing Next.js application.
+      # ------------------------------------------------------------
+      - name: Build 9Router
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$APP_DIR"
+
+          npm run build
+
+          test -f .next-cli-build/BUILD_ID
+
+          echo "Build:"
+          du -sh .next-cli-build
+          find .next-cli-build -maxdepth 2 -type f | head -50
+
+      # ------------------------------------------------------------
+      # Reinstall production dependencies with scripts enabled.
+      #
+      # This gives native dependencies a chance to build correctly
+      # on the actual Linux x86_64 GitHub runner.
+      # ------------------------------------------------------------
+      - name: Prepare runtime dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$APP_DIR"
+
+          rm -rf node_modules
+
+          if [ -f package-lock.json ]; then
+            npm ci \
+              --omit=dev \
+              --ignore-scripts=false
+          else
+            npm install \
+              --omit=dev \
+              --ignore-scripts=false
+          fi
+
+      # ------------------------------------------------------------
+      # Create the runtime archive.
+      #
+      # The archive becomes an embedded SEA asset.
+      # ------------------------------------------------------------
+      - name: Package 9Router runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p build
+
+          cd "$APP_DIR"
+
+          tar \
+            --exclude='./logs' \
+            --exclude='./.git' \
+            -czf "$GITHUB_WORKSPACE/build/9router-runtime.tar.gz" \
+            .next-cli-build \
+            node_modules \
+            public \
+            src \
+            package.json \
+            server.js \
+            custom-server.js
+
+          ls -lh "$GITHUB_WORKSPACE/build/9router-runtime.tar.gz"
+
+      # ------------------------------------------------------------
+      # Create the SEA launcher.
+      #
+      # It:
+      #   1. obtains the embedded runtime archive
+      #   2. extracts it into a temporary directory
+      #   3. starts 9Router's custom server
+      #
+      # Nibrun supplies its HTTP port through NIBRUN_HTTP_PORT.
+      # ------------------------------------------------------------
+      - name: Create SEA launcher
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p build
+
+          cat > build/sea-main.js <<'EOF'
+          'use strict';
+
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const os = require('node:os');
+          const cp = require('node:child_process');
+          const { getAsset } = require('node:sea');
+
+          const port =
+            process.env.PORT ||
+            process.env.NIBRUN_HTTP_PORT ||
+            '20128';
+
+          const root = fs.mkdtempSync(
+            path.join(os.tmpdir(), '9router-')
+          );
+
+          const archive = path.join(root, 'runtime.tar.gz');
+
+          fs.writeFileSync(
+            archive,
+            Buffer.from(getAsset('9router-runtime.tar.gz'))
+          );
+
+          cp.execFileSync(
+            'tar',
+            [
+              '-xzf',
+              archive,
+              '-C',
+              root
+            ],
+            {
+              stdio: 'inherit'
+            }
+          );
+
+          fs.unlinkSync(archive);
+
+          process.env.NODE_ENV = 'production';
+          process.env.PORT = String(port);
+          process.env.HOSTNAME =
+            process.env.HOSTNAME || '0.0.0.0';
+
+          process.chdir(root);
+
+          console.log('9Router 0.5.35');
+          console.log('Runtime:', root);
+          console.log('Port:', process.env.PORT);
+
+          require(path.join(root, 'custom-server.js'));
+          EOF
+
+      - name: Create SEA configuration
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > build/sea-config.json <<EOF
+          {
+            "main": "$GITHUB_WORKSPACE/build/sea-main.js",
+            "output": "$GITHUB_WORKSPACE/build/sea-prep.blob",
+            "disableExperimentalSEAWarning": true,
+            "useCodeCache": false,
+            "useSnapshot": false,
+            "assets": {
+              "9router-runtime.tar.gz": "$GITHUB_WORKSPACE/build/9router-runtime.tar.gz"
+            }
+          }
+          EOF
+
+          cat build/sea-config.json
+
+      # ------------------------------------------------------------
+      # Generate the SEA blob with the SAME Node version that will
+      # be injected into the final executable.
+      # ------------------------------------------------------------
+      - name: Generate SEA blob
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          node --version
+          node --experimental-sea-config build/sea-config.json
+
+          ls -lh build/sea-prep.blob
+
+      - name: Install postject
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          npm install \
+            --no-save \
+            --no-package-lock \
+            postject@1.0.0-alpha.6
+
+      # ------------------------------------------------------------
+      # Copy the Linux x86_64 Node executable.
+      # ------------------------------------------------------------
+      - name: Create Nibrun executable
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cp "$(command -v node)" build/9router
+
+          chmod +x build/9router
+
+          ./node_modules/.bin/postject \
+            build/9router \
+            NODE_SEA_BLOB \
+            build/sea-prep.blob \
+            --sentinel-fuse NODE_SEA_FUSE_fce680d5e4c8a1b6f3b1e7d9a5c2f4b8
+
+          chmod +x build/9router
+
+          file build/9router
+
+          ls -lh build/9router
+
+      # ------------------------------------------------------------
+      # Local executable test.
+      # ------------------------------------------------------------
+      - name: Test Nibrun executable
+        shell: bash
+        env:
+          PORT: "20128"
+          HOSTNAME: "127.0.0.1"
+        run: |
+          set -euxo pipefail
+
+          ./build/9router > build/9router.log 2>&1 &
+          PID=$!
+
+          cleanup() {
+            kill "$PID" 2>/dev/null || true
+          }
+
+          trap cleanup EXIT
+
+          echo "Waiting for 9Router..."
+
+          for i in $(seq 1 60); do
+            if curl -fsS \
+              http://127.0.0.1:20128/ \
+              >/dev/null 2>&1; then
+              echo "9Router is responding"
+              break
+            fi
+
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "9Router exited"
+              cat build/9router.log
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          curl -i \
+            http://127.0.0.1:20128/ \
+            | head -30
+
+          echo
+          echo "Server log:"
+          cat build/9router.log
+
+      # ------------------------------------------------------------
+      # Verify it is actually a Linux executable and not an archive.
+      # ------------------------------------------------------------
+      - name: Verify artifact
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          file build/9router
+
+          test -x build/9router
+
+          sha256sum build/9router \
+            | tee build/9router.sha256
+
+      # ------------------------------------------------------------
+      # Upload the binary to GitHub Actions.
+      # ------------------------------------------------------------
+      - name: Upload Nibrun binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: 9router-v0.5.35-nibrun-linux-x64
+          path: |
+            build/9router
+            build/9router.sha256
+            build/9router.log
+          if-no-files-found: error
+          retention-days: 30
