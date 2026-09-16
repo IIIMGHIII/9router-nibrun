@@ -1,129 +1,63 @@
-name: Build nibrun binary
-
-on:
-  workflow_dispatch: {}
-
-permissions:
-  contents: write   # needed to create the release + upload the asset
-
-jobs:
-  build-and-release:
-    runs-on: ubuntu-latest
-    steps:
-      # This repo holds only this workflow, not 9router's source —
-      # pull the actual app from upstream. Pin `ref` to a release tag
-      # (e.g. v0.5.35) instead of `master` if you want reproducible builds.
-      - name: Checkout 9router source
-        uses: actions/checkout@v4
-        with:
-          repository: decolua/9router
-          ref: master
-          path: 9router
-
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      # 9router installs with npm but builds fine under bun for this step,
-      # matching the repo's own build:bun script.
-      - name: Install dependencies
-        working-directory: 9router
-        run: npm install
-
-      - name: Build Next.js standalone bundle
-        working-directory: 9router
-        run: bun run build:bun
-        env:
-          NEXT_TELEMETRY_DISABLED: "1"
-
-      - name: Verify standalone build is self-contained
-        run: |
-          test -f 9router/.next/standalone/custom-server.js
-          test -f 9router/.next/standalone/server.js
-
-      # Bun's --compile cannot statically bundle the real Next.js server
-      # (its internals reference dozens of optional/dev-only packages never
-      # meant to be traced ahead of time — webpack, sass, critters, the
-      # react-server-dom variants, etc.). So instead of compiling the app,
-      # we archive the whole working standalone build (real files, real
-      # node_modules) and let a tiny launcher extract + require() it from
-      # real disk at boot — ordinary runtime module resolution, no static
-      # bundling involved.
       - name: Archive the standalone build
-        run: tar czf app-bundle.tar.gz -C 9router/.next/standalone .
+        run: |
+          tar czf app-bundle.tar.gz -C 9router/.next/standalone .
+          sha256sum app-bundle.tar.gz | awk '{print $1}' > bundle.sha256
 
       - name: Write launcher
         run: |
+          STAMP=$(cat bundle.sha256)
+          cat > stamp.js << EOF
+          export const BUNDLE_STAMP = "${STAMP}";
+          EOF
           cat > launcher.js << 'EOF'
           import bundleAsset from "./app-bundle.tar.gz" with { type: "file" };
-          import { existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
-          import { execFileSync } from "child_process";
+          import { BUNDLE_STAMP } from "./stamp.js";
+          import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "fs";
           import path from "path";
 
           const nibrunDataDir = process.env.NIBRUN_DATA_DIR || process.env.DATA_DIR || "/app/data";
-
-          // Code is re-extracted fresh on every boot, so it always matches the
-          // currently deployed binary — never mix this with persistent app state.
           const codeDir = path.join(nibrunDataDir, "app-code");
-
-          // 9router's own database/config lives here instead, untouched by extraction.
           const stateDir = path.join(nibrunDataDir, "state");
+          const stampPath = path.join(nibrunDataDir, ".app-code-stamp");
 
-          rmSync(codeDir, { recursive: true, force: true });
           mkdirSync(codeDir, { recursive: true });
           mkdirSync(stateDir, { recursive: true });
 
-          const tarBuf = Buffer.from(await Bun.file(bundleAsset).arrayBuffer());
-          const tmpTar = "/tmp/app-bundle.tar.gz";
-          writeFileSync(tmpTar, tarBuf);
-          execFileSync("tar", ["xzf", tmpTar, "-C", codeDir]);
+          const ready =
+            existsSync(path.join(codeDir, "custom-server.js")) &&
+            existsSync(path.join(codeDir, "server.js")) &&
+            existsSync(stampPath) &&
+            readFileSync(stampPath, "utf8").trim() === BUNDLE_STAMP;
 
-          // HOME=/app is read-only in the guest; point HOME and 9router's DATA_DIR
-          // at the writable, persistent state directory instead.
+          if (!ready) {
+            rmSync(codeDir, { recursive: true, force: true });
+            mkdirSync(codeDir, { recursive: true });
+            const tarBuf = await Bun.file(bundleAsset).bytes();
+            const count = await new Bun.Archive(tarBuf).extract(codeDir);
+            console.log(`[nibrun] extracted ${count} entries`);
+            writeFileSync(stampPath, BUNDLE_STAMP);
+          }
+
+          // HOME=/app is read-only; keep 9router state off the extracted code tree.
           process.env.HOME = stateDir;
           process.env.DATA_DIR = stateDir;
+          process.env.NODE_ENV = "production";
+          // Next binds to HOSTNAME. Do not use NIBRUN_HOSTNAME (public DNS).
+          process.env.HOSTNAME = "0.0.0.0";
+          if (process.env.NIBRUN_HTTP_PORT) {
+            process.env.PORT = process.env.NIBRUN_HTTP_PORT;
+          }
 
+          process.chdir(codeDir);
+          // custom-server.js only starts Next when it is main — require the wrap,
+          // then start standalone server.js ourselves.
           require(path.join(codeDir, "custom-server.js"));
+          require(path.join(codeDir, "server.js"));
           EOF
 
-      # launcher.js only touches fs/path/child_process (Bun builtins) plus
-      # the embedded tar.gz asset — nothing here needs Next.js's module
-      # graph, so this compiles cleanly.
       - name: Compile launcher to a single Linux x64 binary
         run: |
           bun build --compile \
             --target=bun-linux-x64 \
             ./launcher.js \
             --outfile 9router-linux-x64
-
-      - name: Checksum
-        run: sha256sum 9router-linux-x64 > SHA256SUMS
-
-      # Tag with the date, so a same-day rerun doesn't collide.
-      - name: Compute release tag
-        id: tag
-        run: |
-          base="v$(date +%Y.%m.%d)"
-          n=1
-          tag="${base}-${n}"
-          while gh release view "$tag" >/dev/null 2>&1; do
-            n=$((n + 1))
-            tag="${base}-${n}"
-          done
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          files: |
-            9router-linux-x64
-            SHA256SUMS
-
-      - name: Print deploy link
-        run: |
-          echo "Paste this into the nibrun dashboard's deploy-from-URL field:"
-          echo "https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/9router-linux-x64"
