@@ -1,63 +1,120 @@
-      - name: Archive the standalone build
+name: Build nibrun binary
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 9router source
+        uses: actions/checkout@v4
+        with:
+          repository: decolua/9router
+          ref: master
+          path: 9router
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        working-directory: 9router
+        run: npm install
+
+      - name: Build Next.js standalone bundle
+        working-directory: 9router
+        run: bun run build:bun
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+
+      - name: Verify standalone build is self-contained
         run: |
-          tar czf app-bundle.tar.gz -C 9router/.next/standalone .
-          sha256sum app-bundle.tar.gz | awk '{print $1}' > bundle.sha256
+          test -f 9router/.next/standalone/custom-server.js
+          test -f 9router/.next/standalone/server.js
+
+      - name: Archive the standalone build
+        run: tar czf app-bundle.tar.gz -C 9router/.next/standalone .
+
+      - name: Write stamp module
+        run: echo "export const BUNDLE_STAMP = \"$(sha256sum app-bundle.tar.gz | awk '{print $1}')\";" > stamp.js
 
       - name: Write launcher
-        run: |
-          STAMP=$(cat bundle.sha256)
-          cat > stamp.js << EOF
-          export const BUNDLE_STAMP = "${STAMP}";
-          EOF
-          cat > launcher.js << 'EOF'
-          import bundleAsset from "./app-bundle.tar.gz" with { type: "file" };
-          import { BUNDLE_STAMP } from "./stamp.js";
-          import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "fs";
-          import path from "path";
+        env:
+          LAUNCHER_JS: |
+            import bundleAsset from "./app-bundle.tar.gz" with { type: "file" };
+            import { BUNDLE_STAMP } from "./stamp.js";
+            import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+            import { createRequire } from "node:module";
+            import path from "node:path";
 
-          const nibrunDataDir = process.env.NIBRUN_DATA_DIR || process.env.DATA_DIR || "/app/data";
-          const codeDir = path.join(nibrunDataDir, "app-code");
-          const stateDir = path.join(nibrunDataDir, "state");
-          const stampPath = path.join(nibrunDataDir, ".app-code-stamp");
+            const nibrunDataDir = process.env.NIBRUN_DATA_DIR || process.env.DATA_DIR || "/app/data";
+            const codeDir = path.join(nibrunDataDir, "app-code");
+            const stateDir = path.join(nibrunDataDir, "state");
+            const stampPath = path.join(nibrunDataDir, ".app-code-stamp");
 
-          mkdirSync(codeDir, { recursive: true });
-          mkdirSync(stateDir, { recursive: true });
-
-          const ready =
-            existsSync(path.join(codeDir, "custom-server.js")) &&
-            existsSync(path.join(codeDir, "server.js")) &&
-            existsSync(stampPath) &&
-            readFileSync(stampPath, "utf8").trim() === BUNDLE_STAMP;
-
-          if (!ready) {
-            rmSync(codeDir, { recursive: true, force: true });
             mkdirSync(codeDir, { recursive: true });
-            const tarBuf = await Bun.file(bundleAsset).bytes();
-            const count = await new Bun.Archive(tarBuf).extract(codeDir);
-            console.log(`[nibrun] extracted ${count} entries`);
-            writeFileSync(stampPath, BUNDLE_STAMP);
-          }
+            mkdirSync(stateDir, { recursive: true });
 
-          // HOME=/app is read-only; keep 9router state off the extracted code tree.
-          process.env.HOME = stateDir;
-          process.env.DATA_DIR = stateDir;
-          process.env.NODE_ENV = "production";
-          // Next binds to HOSTNAME. Do not use NIBRUN_HOSTNAME (public DNS).
-          process.env.HOSTNAME = "0.0.0.0";
-          if (process.env.NIBRUN_HTTP_PORT) {
-            process.env.PORT = process.env.NIBRUN_HTTP_PORT;
-          }
+            const ready =
+              existsSync(path.join(codeDir, "custom-server.js")) &&
+              existsSync(path.join(codeDir, "server.js")) &&
+              existsSync(stampPath) &&
+              readFileSync(stampPath, "utf8").trim() === BUNDLE_STAMP;
 
-          process.chdir(codeDir);
-          // custom-server.js only starts Next when it is main — require the wrap,
-          // then start standalone server.js ourselves.
-          require(path.join(codeDir, "custom-server.js"));
-          require(path.join(codeDir, "server.js"));
-          EOF
+            if (!ready) {
+              rmSync(codeDir, { recursive: true, force: true });
+              mkdirSync(codeDir, { recursive: true });
+              const tarBuf = await Bun.file(bundleAsset).bytes();
+              const count = await new Bun.Archive(tarBuf).extract(codeDir);
+              console.log("[nibrun] extracted " + count + " entries");
+              writeFileSync(stampPath, BUNDLE_STAMP);
+            }
+
+            process.env.HOME = stateDir;
+            process.env.DATA_DIR = stateDir;
+            process.env.NODE_ENV = "production";
+            process.env.HOSTNAME = "0.0.0.0";
+            if (process.env.NIBRUN_HTTP_PORT) {
+              process.env.PORT = process.env.NIBRUN_HTTP_PORT;
+            }
+
+            process.chdir(codeDir);
+            const require = createRequire(path.join(codeDir, "server.js"));
+            require(path.join(codeDir, "custom-server.js"));
+            require(path.join(codeDir, "server.js"));
+        run: printf '%s\n' "$LAUNCHER_JS" > launcher.js
 
       - name: Compile launcher to a single Linux x64 binary
+        run: bun build --compile --target=bun-linux-x64 ./launcher.js --outfile 9router-linux-x64
+
+      - name: Checksum
+        run: sha256sum 9router-linux-x64 > SHA256SUMS
+
+      - name: Compute release tag
+        id: tag
         run: |
-          bun build --compile \
-            --target=bun-linux-x64 \
-            ./launcher.js \
-            --outfile 9router-linux-x64
+          base="v$(date +%Y.%m.%d)"
+          n=1
+          tag="${base}-${n}"
+          while gh release view "$tag" >/dev/null 2>&1; do
+            n=$((n + 1))
+            tag="${base}-${n}"
+          done
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            9router-linux-x64
+            SHA256SUMS
+
+      - name: Print deploy link
+        run: |
+          echo "Paste this into the nibrun dashboard's deploy-from-URL field:"
+          echo "https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/9router-linux-x64"
