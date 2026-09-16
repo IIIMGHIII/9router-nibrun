@@ -9,8 +9,14 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      # This repo holds only the deploy workflow, not 9router's source —
+      # pull the actual app from upstream. Pin `ref` to a release tag
+      # (e.g. v0.5.35) instead of `master` if you want reproducible builds.
+      - name: Checkout 9router source
         uses: actions/checkout@v4
+        with:
+          repository: decolua/9router
+          ref: master
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
