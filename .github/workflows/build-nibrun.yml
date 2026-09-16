@@ -34,6 +34,37 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: "1"
 
+      # custom-server.js locates server.js via a *computed* path
+      # (path.join(__dirname, "server.js")), so Bun's --compile bundler can't
+      # statically trace it and never embeds the real standalone server —
+      # it falls through to a dev-only fallback that shells out to
+      # next/dist/bin/next, baking in a CI-only absolute path that doesn't
+      # exist at runtime. Force a literal require so Bun can actually embed it.
+      - name: Patch custom-server.js for static bundling
+        run: |
+          node -e '
+            const fs = require("fs");
+            const file = ".next/standalone/custom-server.js";
+            let src = fs.readFileSync(file, "utf8");
+            const needle = `if (require.main === module) {
+  const standalone = path.join(__dirname, "server.js");
+  if (fs.existsSync(standalone)) {
+    require(standalone);
+  } else {
+    // Repo checkout has no standalone build next to us. \`next start\` builds its HTTP
+    // server in-process, so the wrapper above still sanitizes every request.
+    const nextBin = require.resolve("next/dist/bin/next");
+    process.argv = [process.argv[0], nextBin, "start", ...process.argv.slice(2)];
+    require(nextBin);
+  }
+}`;
+            if (!src.includes(needle)) {
+              throw new Error("custom-server.js entrypoint block has changed upstream — update the patch");
+            }
+            src = src.replace(needle, `if (require.main === module) {\n  require("./server.js");\n}`);
+            fs.writeFileSync(file, src);
+          '
+
       # Compiles .next/standalone/custom-server.js (+ its bundled deps)
       # into one self-contained Linux x64 executable — the shape nibrun expects.
       - name: Compile to a single Linux x64 binary
