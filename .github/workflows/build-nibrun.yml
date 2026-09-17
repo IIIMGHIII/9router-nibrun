@@ -31,10 +31,11 @@ jobs:
           bun-version: latest
 
       # Full install (with devDependencies) — the build needs typescript,
-      # the Tailwind toolchain, etc.
+      # the Tailwind toolchain, etc. Using `npm install` rather than
+      # `npm ci` since 9router doesn't commit a package-lock.json.
       - name: Install dependencies
         working-directory: 9router
-        run: npm ci
+        run: npm install
 
       - name: Build Next.js app
         working-directory: 9router
@@ -47,11 +48,11 @@ jobs:
       # errors: Next's .next/standalone output only ships whatever its
       # tracer *thinks* each page needs, and that tracing has real gaps
       # (undici, and whatever else it'd surface next). A full npm install
-      # against package-lock.json has no such gaps — everything genuinely
-      # depended on is present, full stop.
+      # has no such gaps — everything genuinely depended on is present,
+      # full stop.
       - name: Install production-only dependencies
         working-directory: 9router
-        run: npm ci --omit=dev
+        run: npm install --omit=dev
 
       - name: Verify build is self-contained
         run: |
