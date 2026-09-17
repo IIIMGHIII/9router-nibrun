@@ -44,12 +44,11 @@ jobs:
           NEXT_TELEMETRY_DISABLED: "1"
 
       # Swap devDependencies out for a clean, complete production-only
-      # node_modules. This is the actual fix for the "Cannot find module"
-      # errors: Next's .next/standalone output only ships whatever its
-      # tracer *thinks* each page needs, and that tracing has real gaps
-      # (undici, and whatever else it'd surface next). A full npm install
-      # has no such gaps — everything genuinely depended on is present,
-      # full stop.
+      # node_modules. This is the fix for "Cannot find module" errors:
+      # Next's .next/standalone output only ships whatever its tracer
+      # *thinks* each page needs, and that tracing has real gaps (undici,
+      # and whatever else it'd surface next). A full npm install has no
+      # such gaps — everything genuinely depended on is present, full stop.
       - name: Install production-only dependencies
         working-directory: 9router
         run: npm install --omit=dev
@@ -61,106 +60,100 @@ jobs:
           test -d 9router/node_modules/next
           test -d 9router/node_modules/undici
 
-      - name: Download portable Node
+      # nibrun caps uploaded binaries at 256 MB, and the full production
+      # node_modules for an app this size carries real dead weight at
+      # runtime: markdown, changelogs, source maps, .ts source (only the
+      # compiled .js is ever required), and test fixtures. None of this
+      # is loaded by node_modules resolution, so it's safe to strip.
+      - name: Prune dead weight from node_modules
         run: |
           set -euo pipefail
-          TARBALL=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | awk '/node-v22\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz$/{print $2; exit}')
-          curl -fsSLo node.tar.xz "https://nodejs.org/dist/latest-v22.x/${TARBALL}"
-          tar -xJf node.tar.xz
-          cp node-v22.*/bin/node 9router/node
-          chmod +x 9router/node
-          9router/node -v
+          BEFORE=$(du -sh 9router/node_modules | cut -f1)
+          find 9router/node_modules -type f \( \
+              -iname '*.md' -o -iname '*.markdown' -o \
+              -iname 'license*' -o -iname 'licence*' -o \
+              -iname 'changelog*' -o -iname '*.map' -o \
+              -iname '*.ts' \
+            \) -delete
+          find 9router/node_modules -type d \( \
+              -iname 'test' -o -iname 'tests' -o -iname '__tests__' -o \
+              -iname 'example' -o -iname 'examples' -o -iname 'docs' -o \
+              -iname '.github' \
+            \) -prune -exec rm -rf {} +
+          AFTER=$(du -sh 9router/node_modules | cut -f1)
+          echo "node_modules: $BEFORE -> $AFTER"
 
       # Full repo tree — real node_modules, real .next build, public/, src/
       # (custom-server.js dynamically loads a module under src/ if present),
-      # custom-server.js, package.json, and the portable node binary.
-      # .git and the build cache are excluded; nothing else is trimmed.
+      # custom-server.js, and package.json. .git and the build cache are
+      # excluded. Piped through gzip -9 explicitly for max compression,
+      # since every MB counts against nibrun's 256 MB binary cap.
       - name: Archive the build
         run: |
-          tar czf app-bundle.tar.gz \
+          tar cf - \
             --exclude=.git \
             --exclude=.next/cache \
-            -C 9router .
+            -C 9router . | gzip -9 > app-bundle.tar.gz
+          echo "archive size: $(du -h app-bundle.tar.gz | cut -f1)"
 
       - name: Write launcher
         env:
           LAUNCHER_B64: |
             aW1wb3J0IGJ1bmRsZUFzc2V0IGZyb20gIi4vYXBwLWJ1bmRsZS50YXIuZ3oiIHdpdGggeyB0eXBl
             OiAiZmlsZSIgfTsKaW1wb3J0IHsgQlVORExFX1NUQU1QIH0gZnJvbSAiLi9zdGFtcC5qcyI7Cmlt
-            cG9ydCB7CiAgZXhpc3RzU3luYywKICBta2RpclN5bmMsCiAgcm1TeW5jLAogIHdyaXRlRmlsZVN5
-            bmMsCiAgcmVhZEZpbGVTeW5jLAogIGNobW9kU3luYywKfSBmcm9tICJub2RlOmZzIjsKaW1wb3J0
-            IHsgc3Bhd24gfSBmcm9tICJub2RlOmNoaWxkX3Byb2Nlc3MiOwppbXBvcnQgeyBkbG9wZW4sIEZG
-            SVR5cGUsIHB0ciB9IGZyb20gImJ1bjpmZmkiOwppbXBvcnQgcGF0aCBmcm9tICJub2RlOnBhdGgi
-            OwoKY29uc3QgbmlicnVuRGF0YURpciA9CiAgcHJvY2Vzcy5lbnYuTklCUlVOX0RBVEFfRElSIHx8
-            IHByb2Nlc3MuZW52LkRBVEFfRElSIHx8ICIvYXBwL2RhdGEiOwpjb25zdCBjb2RlRGlyID0gcGF0
-            aC5qb2luKG5pYnJ1bkRhdGFEaXIsICJhcHAtY29kZSIpOwpjb25zdCBzdGF0ZURpciA9IHBhdGgu
-            am9pbihuaWJydW5EYXRhRGlyLCAic3RhdGUiKTsKY29uc3Qgc3RhbXBQYXRoID0gcGF0aC5qb2lu
-            KG5pYnJ1bkRhdGFEaXIsICIuYXBwLWNvZGUtc3RhbXAiKTsKCm1rZGlyU3luYyhzdGF0ZURpciwg
-            eyByZWN1cnNpdmU6IHRydWUgfSk7CgovLyBGdWxsIHByb2R1Y3Rpb24gYnVpbGQgKHJlYWwgbm9k
-            ZV9tb2R1bGVzLCBub3QgTmV4dCdzIHRyYWNlZCAic3RhbmRhbG9uZSIKLy8gc3Vic2V0KSDigJQg
-            bm8gc2VydmVyLmpzIGhlcmUsIGN1c3RvbS1zZXJ2ZXIuanMncyBvd24gZmFsbGJhY2sgYnJhbmNo
-            IHNwYXducwovLyBgbmV4dCBzdGFydGAgYWdhaW5zdCB0aGUgZnVsbCBub2RlX21vZHVsZXMgaW5z
-            dGVhZC4KY29uc3QgcmVhZHkgPQogIGV4aXN0c1N5bmMocGF0aC5qb2luKGNvZGVEaXIsICJjdXN0
-            b20tc2VydmVyLmpzIikpICYmCiAgZXhpc3RzU3luYyhwYXRoLmpvaW4oY29kZURpciwgIm5vZGUi
-            KSkgJiYKICBleGlzdHNTeW5jKHBhdGguam9pbihjb2RlRGlyLCAibm9kZV9tb2R1bGVzL25leHQi
-            KSkgJiYKICBleGlzdHNTeW5jKHN0YW1wUGF0aCkgJiYKICByZWFkRmlsZVN5bmMoc3RhbXBQYXRo
-            LCAidXRmOCIpLnRyaW0oKSA9PT0gQlVORExFX1NUQU1QOwoKaWYgKCFyZWFkeSkgewogIHJtU3lu
-            Yyhjb2RlRGlyLCB7IHJlY3Vyc2l2ZTogdHJ1ZSwgZm9yY2U6IHRydWUgfSk7CiAgbWtkaXJTeW5j
-            KGNvZGVEaXIsIHsgcmVjdXJzaXZlOiB0cnVlIH0pOwogIGNvbnN0IHRhckJ1ZiA9IGF3YWl0IEJ1
-            bi5maWxlKGJ1bmRsZUFzc2V0KS5ieXRlcygpOwogIGNvbnN0IGNvdW50ID0gYXdhaXQgbmV3IEJ1
-            bi5BcmNoaXZlKHRhckJ1ZikuZXh0cmFjdChjb2RlRGlyKTsKICBjb25zb2xlLmxvZygiW25pYnJ1
-            bl0gZXh0cmFjdGVkICIgKyBjb3VudCArICIgZW50cmllcyIpOwogIHdyaXRlRmlsZVN5bmMoc3Rh
-            bXBQYXRoLCBCVU5ETEVfU1RBTVApOwp9Cgpjb25zdCBub2RlQmluID0gcGF0aC5qb2luKGNvZGVE
-            aXIsICJub2RlIik7CmNvbnN0IHNjcmlwdCA9IHBhdGguam9pbihjb2RlRGlyLCAiY3VzdG9tLXNl
-            cnZlci5qcyIpOwppZiAoIWV4aXN0c1N5bmMobm9kZUJpbikpIHRocm93IG5ldyBFcnJvcigibWlz
-            c2luZyBleHRyYWN0ZWQgbm9kZSBiaW5hcnkiKTsKaWYgKCFleGlzdHNTeW5jKHBhdGguam9pbihj
-            b2RlRGlyLCAibm9kZV9tb2R1bGVzL25leHQiKSkpIHsKICB0aHJvdyBuZXcgRXJyb3IoImJ1bmRs
-            ZSBtaXNzaW5nIG5vZGVfbW9kdWxlcy9uZXh0Iik7Cn0KY2htb2RTeW5jKG5vZGVCaW4sIDBvNzU1
-            KTsKCnByb2Nlc3MuZW52LkhPTUUgPSBzdGF0ZURpcjsKcHJvY2Vzcy5lbnYuREFUQV9ESVIgPSBz
-            dGF0ZURpcjsKcHJvY2Vzcy5lbnYuTk9ERV9FTlYgPSAicHJvZHVjdGlvbiI7CnByb2Nlc3MuZW52
-            LkhPU1ROQU1FID0gIjAuMC4wLjAiOwppZiAocHJvY2Vzcy5lbnYuTklCUlVOX0hUVFBfUE9SVCkg
-            cHJvY2Vzcy5lbnYuUE9SVCA9IHByb2Nlc3MuZW52Lk5JQlJVTl9IVFRQX1BPUlQ7CnByb2Nlc3Mu
-            ZW52Lk5PREVfT1BUSU9OUyA9IFtwcm9jZXNzLmVudi5OT0RFX09QVElPTlMsICItLW1heC1vbGQt
-            c3BhY2Utc2l6ZT0xNjAiXQogIC5maWx0ZXIoQm9vbGVhbikKICAuam9pbigiICIpOwoKcHJvY2Vz
-            cy5jaGRpcihjb2RlRGlyKTsKCmZ1bmN0aW9uIGNMaXN0KGxpc3QpIHsKICBjb25zdCBidWZzID0g
-            bGlzdC5tYXAoKHMpID0+IEJ1ZmZlci5mcm9tKFN0cmluZyhzKSArICJcMCIpKTsKICBjb25zdCB0
-            YWJsZSA9IG5ldyBCaWdVaW50NjRBcnJheShsaXN0Lmxlbmd0aCArIDEpOwogIGZvciAobGV0IGkg
-            PSAwOyBpIDwgYnVmcy5sZW5ndGg7IGkrKykgdGFibGVbaV0gPSBCaWdJbnQocHRyKGJ1ZnNbaV0p
-            KTsKICByZXR1cm4geyBidWZzLCB0YWJsZSwgcDogcHRyKHRhYmxlKSB9Owp9CgpmdW5jdGlvbiBl
-            eGVjdmVSZXBsYWNlKGZpbGUsIGFyZ3YsIGVudikgewogIGNvbnN0IGxpYmNGaWxlcyA9IFsKICAg
-            ICIvbGliL3g4Nl82NC1saW51eC1nbnUvbGliYy5zby42IiwKICAgICIvbGliNjQvbGliYy5zby42
-            IiwKICAgICJsaWJjLnNvLjYiLAogIF07CiAgbGV0IGxpYmM7CiAgZm9yIChjb25zdCBmIG9mIGxp
-            YmNGaWxlcykgewogICAgdHJ5IHsKICAgICAgbGliYyA9IGRsb3BlbihmLCB7CiAgICAgICAgZXhl
-            Y3ZlOiB7CiAgICAgICAgICBhcmdzOiBbRkZJVHlwZS5jc3RyaW5nLCBGRklUeXBlLnB0ciwgRkZJ
-            VHlwZS5wdHJdLAogICAgICAgICAgcmV0dXJuczogRkZJVHlwZS5pMzIsCiAgICAgICAgfSwKICAg
-            ICAgfSk7CiAgICAgIGJyZWFrOwogICAgfSBjYXRjaCB7fQogIH0KICBpZiAoIWxpYmMpIHRocm93
-            IG5ldyBFcnJvcigibGliYy5zby42IG5vdCBmb3VuZCIpOwogIGNvbnN0IGEgPSBjTGlzdChhcmd2
-            KTsKICBjb25zdCBlID0gY0xpc3QoCiAgICBPYmplY3QuZW50cmllcyhlbnYpCiAgICAgIC5maWx0
-            ZXIoKGt2KSA9PiB0eXBlb2Yga3ZbMV0gPT09ICJzdHJpbmciKQogICAgICAubWFwKChrdikgPT4g
-            a3ZbMF0gKyAiPSIgKyBrdlsxXSkKICApOwogIGdsb2JhbFRoaXMuX19leGVjUGluID0gW2EsIGVd
-            OwogIGxpYmMuc3ltYm9scy5leGVjdmUoZmlsZSwgYS5wLCBlLnApOwogIHRocm93IG5ldyBFcnJv
-            cigiZXhlY3ZlIGZhaWxlZCIpOwp9Cgp0cnkgewogIGV4ZWN2ZVJlcGxhY2Uobm9kZUJpbiwgW25v
-            ZGVCaW4sIHNjcmlwdF0sIHByb2Nlc3MuZW52KTsKfSBjYXRjaCAoZXJyKSB7CiAgY29uc29sZS5l
-            cnJvcigiW25pYnJ1bl0gZXhlY3ZlIGZhaWxlZCwgc3Bhd24gZmFsbGJhY2s6IiwgZXJyICYmIGVy
-            ci5tZXNzYWdlKTsKICBjb25zdCBjaGlsZCA9IHNwYXduKG5vZGVCaW4sIFtzY3JpcHRdLCB7CiAg
-            ICBjd2Q6IGNvZGVEaXIsCiAgICBzdGRpbzogImluaGVyaXQiLAogICAgZW52OiBwcm9jZXNzLmVu
-            diwKICB9KTsKICBmb3IgKGNvbnN0IHNpZyBvZiBbIlNJR0lOVCIsICJTSUdURVJNIl0pIHsKICAg
-            IHByb2Nlc3Mub24oc2lnLCAoKSA9PiBjaGlsZC5raWxsKHNpZykpOwogIH0KICBjaGlsZC5vbigi
-            ZXhpdCIsIChjb2RlKSA9PiBwcm9jZXNzLmV4aXQoY29kZSA/PyAxKSk7Cn0K
+            cG9ydCB7IGV4aXN0c1N5bmMsIG1rZGlyU3luYywgcm1TeW5jLCB3cml0ZUZpbGVTeW5jLCByZWFk
+            RmlsZVN5bmMgfSBmcm9tICJub2RlOmZzIjsKaW1wb3J0IHBhdGggZnJvbSAibm9kZTpwYXRoIjsK
+            CmNvbnN0IG5pYnJ1bkRhdGFEaXIgPQogIHByb2Nlc3MuZW52Lk5JQlJVTl9EQVRBX0RJUiB8fCBw
+            cm9jZXNzLmVudi5EQVRBX0RJUiB8fCAiL2FwcC9kYXRhIjsKY29uc3QgY29kZURpciA9IHBhdGgu
+            am9pbihuaWJydW5EYXRhRGlyLCAiYXBwLWNvZGUiKTsKY29uc3Qgc3RhdGVEaXIgPSBwYXRoLmpv
+            aW4obmlicnVuRGF0YURpciwgInN0YXRlIik7CmNvbnN0IHN0YW1wUGF0aCA9IHBhdGguam9pbihu
+            aWJydW5EYXRhRGlyLCAiLmFwcC1jb2RlLXN0YW1wIik7Cgpta2RpclN5bmMoc3RhdGVEaXIsIHsg
+            cmVjdXJzaXZlOiB0cnVlIH0pOwoKY29uc3QgcmVhZHkgPQogIGV4aXN0c1N5bmMocGF0aC5qb2lu
+            KGNvZGVEaXIsICJjdXN0b20tc2VydmVyLmpzIikpICYmCiAgZXhpc3RzU3luYyhwYXRoLmpvaW4o
+            Y29kZURpciwgIm5vZGVfbW9kdWxlcy9uZXh0IikpICYmCiAgZXhpc3RzU3luYyhzdGFtcFBhdGgp
+            ICYmCiAgcmVhZEZpbGVTeW5jKHN0YW1wUGF0aCwgInV0ZjgiKS50cmltKCkgPT09IEJVTkRMRV9T
+            VEFNUDsKCmlmICghcmVhZHkpIHsKICBybVN5bmMoY29kZURpciwgeyByZWN1cnNpdmU6IHRydWUs
+            IGZvcmNlOiB0cnVlIH0pOwogIG1rZGlyU3luYyhjb2RlRGlyLCB7IHJlY3Vyc2l2ZTogdHJ1ZSB9
+            KTsKICBjb25zdCB0YXJCdWYgPSBhd2FpdCBCdW4uZmlsZShidW5kbGVBc3NldCkuYnl0ZXMoKTsK
+            ICBjb25zdCBjb3VudCA9IGF3YWl0IG5ldyBCdW4uQXJjaGl2ZSh0YXJCdWYpLmV4dHJhY3QoY29k
+            ZURpcik7CiAgY29uc29sZS5sb2coIltuaWJydW5dIGV4dHJhY3RlZCAiICsgY291bnQgKyAiIGVu
+            dHJpZXMiKTsKICB3cml0ZUZpbGVTeW5jKHN0YW1wUGF0aCwgQlVORExFX1NUQU1QKTsKfQoKaWYg
+            KCFleGlzdHNTeW5jKHBhdGguam9pbihjb2RlRGlyLCAibm9kZV9tb2R1bGVzL25leHQiKSkpIHsK
+            ICB0aHJvdyBuZXcgRXJyb3IoImJ1bmRsZSBtaXNzaW5nIG5vZGVfbW9kdWxlcy9uZXh0Iik7Cn0K
+            CnByb2Nlc3MuZW52LkhPTUUgPSBzdGF0ZURpcjsKcHJvY2Vzcy5lbnYuREFUQV9ESVIgPSBzdGF0
+            ZURpcjsKcHJvY2Vzcy5lbnYuTk9ERV9FTlYgPSAicHJvZHVjdGlvbiI7CnByb2Nlc3MuZW52LkhP
+            U1ROQU1FID0gIjAuMC4wLjAiOwppZiAocHJvY2Vzcy5lbnYuTklCUlVOX0hUVFBfUE9SVCkgcHJv
+            Y2Vzcy5lbnYuUE9SVCA9IHByb2Nlc3MuZW52Lk5JQlJVTl9IVFRQX1BPUlQ7Cgpwcm9jZXNzLmNo
+            ZGlyKGNvZGVEaXIpOwoKLy8gUnVuIGluLXByb2Nlc3MgdW5kZXIgdGhpcyBzYW1lIEJ1biBydW50
+            aW1lIOKAlCA5cm91dGVyJ3Mgb3duIHBhY2thZ2UuanNvbgovLyBkb2N1bWVudHMgZXhhY3RseSB0
+            aGlzIChzdGFydDpidW4gLT4gImJ1biAuLy5uZXh0L3N0YW5kYWxvbmUvY3VzdG9tLXNlcnZlci5q
+            cyIpCi8vIGFzIGEgc3VwcG9ydGVkIHdheSB0byBydW4gdGhlIGFwcCwgc28gbm8gc2VwYXJhdGUg
+            Tm9kZSBydW50aW1lIGlzIG5lZWRlZC4KcmVxdWlyZShwYXRoLmpvaW4oY29kZURpciwgImN1c3Rv
+            bS1zZXJ2ZXIuanMiKSk7Cg==
         run: |
           echo "$LAUNCHER_B64" | base64 -d > launcher.js
           echo "export const BUNDLE_STAMP = \"$(sha256sum app-bundle.tar.gz | awk '{print $1}')\";" > stamp.js
 
-      # launcher.js only touches fs/path/child_process/bun:ffi (Bun/Node
-      # builtins) plus the embedded tar.gz asset — nothing here needs
-      # Next.js's module graph, so this compiles cleanly regardless of
-      # what's inside the archive.
+      # launcher.js only touches fs/path (Bun/Node builtins) plus the
+      # embedded tar.gz asset — nothing here needs Next.js's module graph,
+      # so this compiles cleanly regardless of what's inside the archive.
       - name: Compile launcher to a single Linux x64 binary
         run: |
           bun build --compile \
             --target=bun-linux-x64 \
             ./launcher.js \
             --outfile 9router-linux-x64
+
+      # nibrun rejects anything over 256 MB at deploy time — fail here
+      # instead, with a size on record, rather than burning a deploy attempt.
+      - name: Verify binary is under nibrun's 256 MB cap
+        run: |
+          SIZE=$(stat -c%s 9router-linux-x64)
+          echo "binary size: $SIZE bytes ($((SIZE / 1024 / 1024)) MB)"
+          if [ "$SIZE" -gt $((256 * 1024 * 1024)) ]; then
+            echo "::error::Binary is $((SIZE / 1024 / 1024)) MB, over nibrun's 256 MB cap"
+            exit 1
+          fi
 
       - name: Checksum
         run: sha256sum 9router-linux-x64 > SHA256SUMS
